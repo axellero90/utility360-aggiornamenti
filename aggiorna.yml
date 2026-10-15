@@ -51,29 +51,26 @@ jobs:
         run: |
           NUOVA="$(curl -fsSL "$CANALE/VERSIONE")"
           ATTUALE="$(git show origin/rilasci:.versione 2>/dev/null || echo nessuna)"
-          echo "Installata: $ATTUALE — disponibile: $NUOVA"
+          echo "Nel ramo rilasci: $ATTUALE — disponibile: $NUOVA"
           echo "versione=$NUOVA" >> "$GITHUB_OUTPUT"
-          # modifiche fatte a mano: differenze tra main e l'ultima versione originale
-          if git rev-parse -q --verify origin/rilasci >/dev/null; then
-            git diff --name-only origin/rilasci HEAD -- . ':(exclude).github' > "$RUNNER_TEMP/modifiche.txt"
-          else
-            : > "$RUNNER_TEMP/modifiche.txt"
-          fi
-          if [ -s "$RUNNER_TEMP/modifiche.txt" ]; then echo "modifiche=si" >> "$GITHUB_OUTPUT"; else echo "modifiche=no" >> "$GITHUB_OUTPUT"; fi
           if [ "$NUOVA" = "$ATTUALE" ]; then
             echo "nuova=no" >> "$GITHUB_OUTPUT"
-            if git rev-parse -q --verify origin/rilasci >/dev/null && ! git merge-base --is-ancestor origin/rilasci HEAD; then
-              echo "::error::La versione $ATTUALE è nel ramo 'rilasci' ma non è ancora unita a main: va unita a mano (vedi ISTRUZIONI-CLAUDE.md nel canale)."
-              exit 1
-            fi
-            echo "Sei già all'ultima versione."
           else
             curl -fsSL "$CANALE/utility360.tar.gz.gpg" -o "$RUNNER_TEMP/u.tar.gz.gpg"
             echo "nuova=si" >> "$GITHUB_OUTPUT"
           fi
+          # modifiche fatte a mano: cambiamenti su main dall'ultima versione originale unita
+          if git rev-parse -q --verify origin/rilasci >/dev/null; then
+            git diff --name-only "$(git merge-base HEAD origin/rilasci)" HEAD -- . ':(exclude).github' > "$RUNNER_TEMP/modifiche.txt"
+            if git merge-base --is-ancestor origin/rilasci HEAD; then echo "da_unire=no" >> "$GITHUB_OUTPUT"; else echo "da_unire=si" >> "$GITHUB_OUTPUT"; fi
+          else
+            : > "$RUNNER_TEMP/modifiche.txt"
+            echo "da_unire=no" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -s "$RUNNER_TEMP/modifiche.txt" ]; then echo "modifiche=si" >> "$GITHUB_OUTPUT"; else echo "modifiche=no" >> "$GITHUB_OUTPUT"; fi
 
       - name: Avvisa della versione nuova
-        if: github.event_name == 'schedule' && steps.controllo.outputs.nuova == 'si'
+        if: github.event_name == 'schedule' && (steps.controllo.outputs.nuova == 'si' || steps.controllo.outputs.da_unire == 'si')
         env:
           GH_TOKEN: ${{ github.token }}
           VERSIONE: ${{ steps.controllo.outputs.versione }}
@@ -89,26 +86,19 @@ jobs:
             echo "Per installarla: **Actions → Aggiorna Utility360 → Run workflow**."
             if [ "$MODIFICHE" = "si" ]; then
               echo
-              echo "Attenzione: nel repo ci sono modifiche fatte a mano, quindi prima controllale. File modificati:"
+              echo "Attenzione: nel repo ci sono modifiche fatte a mano, quindi il primo Run si fermerà per farti controllare. File modificati:"
               sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/modifiche.txt"
-              echo
-              echo "Quando hai controllato, rilancia scegliendo **Ho controllato**."
             fi
           } > "$RUNNER_TEMP/avviso.md"
           gh issue create --title "$TITOLO" --body-file "$RUNNER_TEMP/avviso.md"
 
-      - name: Fermati se ci sono modifiche fatte a mano
-        if: github.event_name == 'workflow_dispatch' && steps.controllo.outputs.nuova == 'si' && steps.controllo.outputs.modifiche == 'si' && !inputs.ho_controllato
-        run: |
-          echo "::error::Nel repo ci sono modifiche fatte a mano: controllale prima di aggiornare, poi rilancia scegliendo 'Ho controllato'."
-          echo "File modificati rispetto alla versione originale:"
-          cat "$RUNNER_TEMP/modifiche.txt"
-          exit 1
-
-      - name: Apri e installa l'aggiornamento
-        if: github.event_name == 'workflow_dispatch' && steps.controllo.outputs.nuova == 'si' && (steps.controllo.outputs.modifiche == 'no' || inputs.ho_controllato)
+      - name: Installa l'aggiornamento
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
+          NUOVA: ${{ steps.controllo.outputs.nuova }}
+          MODIFICHE: ${{ steps.controllo.outputs.modifiche }}
+          HO_CONTROLLATO: ${{ inputs.ho_controllato }}
           PASSWORD: ${{ secrets.PASSWORD_AGGIORNAMENTI }}
           ID_DATABASE: ${{ vars.ID_DATABASE }}
           NOME_WORKER: ${{ vars.NOME_WORKER || 'utility360' }}
@@ -119,49 +109,66 @@ jobs:
           GOOGLE_APP_ID: ${{ vars.GOOGLE_APP_ID }}
         run: |
           set -euo pipefail
-          [ -n "$PASSWORD" ] || { echo "Manca il secret PASSWORD_AGGIORNAMENTI"; exit 1; }
-          [ -n "$ID_DATABASE" ] || { echo "Manca la variabile ID_DATABASE"; exit 1; }
-          printf '%s' "$PASSWORD" | gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 0 \
-            -d -o "$RUNNER_TEMP/u.tar.gz" "$RUNNER_TEMP/u.tar.gz.gpg" \
-            || { echo "Non riesco ad aprire l'aggiornamento: la password è giusta?"; exit 1; }
-          mkdir "$RUNNER_TEMP/nuova"
-          tar -xzf "$RUNNER_TEMP/u.tar.gz" -C "$RUNNER_TEMP/nuova"
           git config user.name "Aggiornamento automatico"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           MAIN="$(git branch --show-current)"
 
-          # 1) la versione originale va nel ramo "rilasci" (la prima volta parte da main)
-          R="$RUNNER_TEMP/rilasci"
-          if git rev-parse -q --verify origin/rilasci >/dev/null; then
-            git worktree add -q -B rilasci "$R" origin/rilasci
+          # 1) se c'è una versione nuova, la versione originale va nel ramo "rilasci" (la prima volta parte da main)
+          if [ "$NUOVA" = "si" ]; then
+            [ -n "$PASSWORD" ] || { echo "::error::Manca il secret PASSWORD_AGGIORNAMENTI"; exit 1; }
+            [ -n "$ID_DATABASE" ] || { echo "::error::Manca la variabile ID_DATABASE"; exit 1; }
+            printf '%s' "$PASSWORD" | gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 0 \
+              -d -o "$RUNNER_TEMP/u.tar.gz" "$RUNNER_TEMP/u.tar.gz.gpg" \
+              || { echo "::error::Non riesco ad aprire l'aggiornamento: la password è giusta?"; exit 1; }
+            mkdir "$RUNNER_TEMP/nuova"
+            tar -xzf "$RUNNER_TEMP/u.tar.gz" -C "$RUNNER_TEMP/nuova"
+            R="$RUNNER_TEMP/rilasci"
+            if git rev-parse -q --verify origin/rilasci >/dev/null; then
+              git worktree add -q -B rilasci "$R" origin/rilasci
+            else
+              git worktree add -q -b rilasci "$R" HEAD
+            fi
+            ( cd "$R"
+              find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github -exec rm -rf {} +
+              cp -a "$RUNNER_TEMP/nuova/." .
+              sed -e "s|__NOME_WORKER__|$NOME_WORKER|" \
+                  -e "s|__NOME_DATABASE__|$NOME_DATABASE|" \
+                  -e "s|__ID_DATABASE__|$ID_DATABASE|" \
+                  -e "s|__NOME_BUCKET__|$NOME_BUCKET|" \
+                  -e "s|__GOOGLE_CLIENT_ID__|$GOOGLE_CLIENT_ID|" \
+                  -e "s|__GOOGLE_API_KEY__|$GOOGLE_API_KEY|" \
+                  -e "s|__GOOGLE_APP_ID__|$GOOGLE_APP_ID|" \
+                  wrangler.modello.toml > wrangler.toml
+              git add -A
+              git commit -q -m "Utility360 $(cat .versione) (originale)" )
+            git push -q origin rilasci
+            git worktree remove --force "$R"
           else
-            git worktree add -q -b rilasci "$R" HEAD
+            git branch -f rilasci origin/rilasci 2>/dev/null || true
           fi
-          ( cd "$R"
-            find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github -exec rm -rf {} +
-            cp -a "$RUNNER_TEMP/nuova/." .
-            sed -e "s|__NOME_WORKER__|$NOME_WORKER|" \
-                -e "s|__NOME_DATABASE__|$NOME_DATABASE|" \
-                -e "s|__ID_DATABASE__|$ID_DATABASE|" \
-                -e "s|__NOME_BUCKET__|$NOME_BUCKET|" \
-                -e "s|__GOOGLE_CLIENT_ID__|$GOOGLE_CLIENT_ID|" \
-                -e "s|__GOOGLE_API_KEY__|$GOOGLE_API_KEY|" \
-                -e "s|__GOOGLE_APP_ID__|$GOOGLE_APP_ID|" \
-                wrangler.modello.toml > wrangler.toml
-            git add -A
-            git commit -q -m "Utility360 $(cat .versione) (originale)" )
-          git push -q origin rilasci
 
-          # 2) unione con main: le modifiche fatte a mano restano
-          if git merge -q --no-edit -m "Aggiornamento a Utility360 $(cat "$R/.versione")" rilasci; then
+          if ! git rev-parse -q --verify rilasci >/dev/null || git merge-base --is-ancestor rilasci HEAD; then
+            echo "Sei già all'ultima versione."; exit 0
+          fi
+          VERSIONE="$(git show rilasci:.versione)"
+
+          # 2) modifiche fatte a mano: prima si controllano
+          if [ "$MODIFICHE" = "si" ] && [ "$HO_CONTROLLATO" != "true" ]; then
+            echo "::error::Versione $VERSIONE pronta ma NON installata: nel repo ci sono modifiche fatte a mano. Controllale, poi rilancia scegliendo 'Ho controllato'."
+            echo "File modificati a mano:"; cat "$RUNNER_TEMP/modifiche.txt"
+            echo "La versione nuova è già nel ramo 'rilasci': per confrontarla, git diff main origin/rilasci."
+            exit 1
+          fi
+
+          # 3) unione con main: le modifiche fatte a mano restano
+          if git merge -q --no-edit -m "Aggiornamento a Utility360 $VERSIONE" rilasci; then
             git push -q origin "$MAIN"
-            echo "Installata la versione $(cat .versione): Cloudflare la pubblica in un paio di minuti."
+            echo "Installata la versione $VERSIONE: Cloudflare la pubblica in un paio di minuti."
             for n in $(gh issue list --state open --search "in:title Nuova versione di Utility360" --json number -q '.[].number'); do
               gh issue close "$n" -c "Installata con l'aggiornamento manuale." >/dev/null || true
             done
           else
             git merge --abort
-            echo "::error::Aggiornamento $(cat "$R/.versione") NON installato: tocca le stesse righe di tue modifiche."
-            echo "La versione nuova è nel ramo 'rilasci'. Unisci 'rilasci' in '$MAIN' a mano (o chiedi a Claude, vedi ISTRUZIONI-CLAUDE.md nel canale)."
+            echo "::error::Versione $VERSIONE NON installata: tocca le stesse righe di tue modifiche. La versione nuova è nel ramo 'rilasci': va unita a mano (vedi ISTRUZIONI-CLAUDE.md nel canale)."
             exit 1
           fi
